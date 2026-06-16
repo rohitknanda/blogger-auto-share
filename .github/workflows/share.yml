@@ -34,7 +34,7 @@ jobs:
           TG_BOT_TOKEN:    ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:      ${{ secrets.TG_CHAT_ID }}
           MAX_CATCHUP:     "1"
-          DRY_RUN:         "true"
+          DRY_RUN:         "false"
           ENABLE_FB:       "true"
           ENABLE_TG:       "true"
         run: python share_to_social.py
