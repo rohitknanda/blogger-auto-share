@@ -113,19 +113,57 @@ def fetch_recent_posts(blog_id, api_key, count=10):
     return http_get_json(url).get("items", [])
 
 
+# Hosts that serve random/placeholder images, not real post images.
+PLACEHOLDER_IMAGE_HOSTS = (
+    "picsum.photos",
+    "via.placeholder.com",
+    "placehold.co",
+    "placekitten.com",
+    "dummyimage.com",
+    "1x1.gif",
+    "data:image",            # inline base64 lazy-load placeholders
+)
+
+
+def _is_placeholder(url):
+    low = url.lower()
+    return any(h in low for h in PLACEHOLDER_IMAGE_HOSTS)
+
+
 def extract_image(post):
+    # 1. Prefer the Blogger API's own image field (the real featured image),
+    #    but skip it if it points at a placeholder host.
     images = post.get("images")
     if images and isinstance(images, list) and images[0].get("url"):
-        return images[0]["url"]
+        url = images[0]["url"]
+        if not _is_placeholder(url):
+            return url
+
+    # 2. Otherwise scan the post body for the first *real* <img>, skipping
+    #    placeholders and lazy-load stand-ins. Many themes put the true URL in
+    #    data-src / data-lazy-src rather than src, so check those first.
     content = post.get("content", "") or ""
-    m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', content, re.IGNORECASE)
-    return m.group(1) if m else None
+    for attr in ("data-src", "data-lazy-src", "data-original", "src"):
+        for m in re.finditer(
+            r'<img[^>]+' + attr + r'=["\']([^"\']+)["\']',
+            content, re.IGNORECASE,
+        ):
+            url = m.group(1)
+            if url and not _is_placeholder(url):
+                return url
+    return None
 
 
 def plain_excerpt(post, limit=300):
     content = post.get("content", "") or ""
-    text = re.sub(r"<[^>]+>", " ", content)
+    # Strip <script>/<style> blocks first so embedded JSON-LD schema metadata
+    # and CSS don't leak into the excerpt.
+    content = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ",
+                     content, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", content)        # strip remaining tags
     text = html.unescape(text)
+    # Drop any leftover JSON-LD-ish noise (lines that are mostly punctuation/braces).
+    text = re.sub(r'\{[^}]*"@context"[^}]*\}', " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     if len(text) > limit:
         text = text[:limit].rsplit(" ", 1)[0] + "\u2026"
