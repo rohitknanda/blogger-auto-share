@@ -74,11 +74,11 @@ def http_get_json(url):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def http_post(url, data):
+def http_post(url, data, timeout=60):
     encoded = parse.urlencode(data).encode("utf-8")
     req = request.Request(url, data=encoded, method="POST",
                           headers={"User-Agent": "blogger-fb-tg-agent/1.0"})
-    with request.urlopen(req, timeout=60) as resp:
+    with request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -251,11 +251,31 @@ def post_to_facebook(page_id, token, title, link, image_url, dry_run=False):
 # --------------------------------------------------------------------------- #
 # Telegram
 # --------------------------------------------------------------------------- #
+def _warm_up_image(image_url):
+    """
+    Request the image once ourselves so a lazily-generated image (e.g. a
+    Pollinations URL behind Google's proxy) is rendered/cached before we ask
+    Telegram to fetch it. Best-effort; ignores all errors.
+    """
+    if not image_url:
+        return
+    try:
+        req = request.Request(image_url, headers={"User-Agent": "Mozilla/5.0"})
+        with request.urlopen(req, timeout=45) as r:
+            r.read(2048)  # touch the first bytes; that's enough to trigger gen
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def post_to_telegram(bot_token, chat_id, title, link, excerpt, image_url,
                      dry_run=False):
     """
     Telegram caption supports HTML, so we make the title bold and the link a
     real clickable "Read more" anchor. Caption hard limit is 1024 chars.
+
+    If sending the photo fails (e.g. Telegram times out fetching a slow image
+    URL), fall back to a plain text message with a link preview so the post is
+    never silently lost.
     """
     safe_title = html.escape(title)
     safe_excerpt = html.escape(excerpt)
@@ -272,23 +292,31 @@ def post_to_telegram(bot_token, chat_id, title, link, excerpt, image_url,
         log(f"   [DRY] TG chat={chat_id} caption={caption!r} image={image_url}")
         return {"dry_run": True}
 
+    send_msg_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    text_payload = {
+        "chat_id": chat_id,
+        "text": caption,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "false",
+    }
+
     if image_url:
-        url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
-        payload = {
+        _warm_up_image(image_url)  # pre-render slow images before Telegram fetches
+        photo_url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
+        photo_payload = {
             "chat_id": chat_id,
             "photo": image_url,
             "caption": caption,
             "parse_mode": "HTML",
         }
-    else:
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        payload = {
-            "chat_id": chat_id,
-            "text": caption,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "false",
-        }
-    return http_post(url, payload)
+        try:
+            # Generous timeout: Telegram must fetch the image server-side.
+            return http_post(photo_url, photo_payload, timeout=120)
+        except Exception as e:  # noqa: BLE001
+            log(f"   TG photo failed ({e}); falling back to text+link message.")
+            return http_post(send_msg_url, text_payload, timeout=60)
+
+    return http_post(send_msg_url, text_payload, timeout=60)
 
 
 # --------------------------------------------------------------------------- #
