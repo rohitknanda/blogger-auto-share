@@ -130,28 +130,89 @@ def _is_placeholder(url):
     return any(h in low for h in PLACEHOLDER_IMAGE_HOSTS)
 
 
+# Hosts that serve REAL post images we should actively prefer.
+PREFERRED_IMAGE_HOSTS = (
+    "pollinations.ai",
+    "blogger.googleusercontent.com",
+    "bp.blogspot.com",
+    "lh3.googleusercontent.com",
+)
+
+
+def _find_in_content_by_host(content, hosts):
+    """Return the first image URL in the content served from one of `hosts`."""
+    for m in re.finditer(r'<img[^>]+>', content, re.IGNORECASE):
+        tag = m.group(0)
+        # check all url-bearing attributes on this <img>
+        for attr in ("data-src", "data-lazy-src", "data-original", "src"):
+            am = re.search(attr + r'=["\']([^"\']+)["\']', tag, re.IGNORECASE)
+            if am:
+                url = am.group(1)
+                low = url.lower()
+                if any(h in low for h in hosts) and not _is_placeholder(url):
+                    return url
+    return None
+
+
+def _og_image_from_page(post_url):
+    """
+    Fetch the post's page HTML and read its <meta property="og:image">.
+    Best-effort only: many blogs sit behind bot protection (Cloudflare etc.)
+    that returns 403 to server requests, so this often fails -- callers must
+    treat None as normal and fall back.
+    """
+    if not post_url:
+        return None
+    try:
+        req = request.Request(
+            post_url,
+            headers={"User-Agent": "Mozilla/5.0 (blogger-fb-tg-agent)"},
+        )
+        with request.urlopen(req, timeout=20) as resp:
+            head = resp.read(120_000).decode("utf-8", "ignore")
+    except Exception:  # noqa: BLE001
+        return None
+
+    for pattern in (
+        r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+        r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+    ):
+        m = re.search(pattern, head, re.IGNORECASE)
+        if m and not _is_placeholder(m.group(1)):
+            return m.group(1)
+    return None
+
+
 def extract_image(post):
-    # 1. Prefer the Blogger API's own image field (the real featured image),
-    #    but skip it if it points at a placeholder host.
+    content = post.get("content", "") or ""
+
+    # 1. Strongly prefer a known real-image host in the post body
+    #    (Pollinations AI image, Blogger/Blogspot uploads, etc.).
+    url = _find_in_content_by_host(content, PREFERRED_IMAGE_HOSTS)
+    if url:
+        return url
+
+    # 2. Blogger API's own image field, unless it's a placeholder.
     images = post.get("images")
     if images and isinstance(images, list) and images[0].get("url"):
-        url = images[0]["url"]
-        if not _is_placeholder(url):
-            return url
+        u = images[0]["url"]
+        if not _is_placeholder(u):
+            return u
 
-    # 2. Otherwise scan the post body for the first *real* <img>, skipping
-    #    placeholders and lazy-load stand-ins. Many themes put the true URL in
-    #    data-src / data-lazy-src rather than src, so check those first.
-    content = post.get("content", "") or ""
+    # 3. Any other real <img> in the body (lazy-load attrs first), skipping
+    #    placeholders.
     for attr in ("data-src", "data-lazy-src", "data-original", "src"):
         for m in re.finditer(
             r'<img[^>]+' + attr + r'=["\']([^"\']+)["\']',
             content, re.IGNORECASE,
         ):
-            url = m.group(1)
-            if url and not _is_placeholder(url):
-                return url
-    return None
+            u = m.group(1)
+            if u and not _is_placeholder(u):
+                return u
+
+    # 4. Last resort: page og:image (often blocked by bot protection).
+    return _og_image_from_page(post.get("url"))
 
 
 def plain_excerpt(post, limit=300):
