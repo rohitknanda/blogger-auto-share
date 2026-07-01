@@ -1,37 +1,33 @@
 #!/usr/bin/env python3
 """
-Blogger -> Facebook Page + Telegram Channel auto-share agent.
+Blogger -> LinkedIn + WhatsApp Channel auto-share agent.
 
-Detects new posts on a Blogger blog (via the Blogger API) and shares each new
-post to:
-  * a Facebook Page      -> photo post: title + featured image + link
-  * a Telegram Channel   -> photo message: image + title + excerpt + clickable
-                            link (Telegram captions allow real hyperlinks)
+Detects new posts on a Blogger blog and shares each new post to:
+  * LinkedIn Page/Profile  -> article share with title + excerpt + link
+  * WhatsApp Channel       -> text + link via WhatsApp Business Cloud API
 
-State is tracked PER PLATFORM in `state.json`, so if one platform fails but the
-other succeeds, only the failed one is retried next run (no duplicate posts).
+State tracked per platform in state.json so no duplicate posts.
 
-The GitHub Actions workflow commits the updated state.json back to the repo
-after each run so nothing is ever posted twice.
+Required environment variables (GitHub Secrets):
+    BLOGGER_API_KEY   - Google API key with Blogger API enabled
+    BLOG_ID           - Blogger blog numeric ID
 
-Required environment variables (set as GitHub repository secrets):
-    BLOGGER_API_KEY   - Google API key with the Blogger API enabled
-    BLOG_ID           - Your Blogger blog's numeric ID
+    # LinkedIn
+    LI_ACCESS_TOKEN   - LinkedIn OAuth2 access token (60-day, refreshable)
+    LI_AUTHOR_URN     - "urn:li:person:XXXX" or "urn:li:organization:XXXX"
 
-    # Facebook
-    FB_PAGE_ID        - Your Facebook Page's numeric ID
-    FB_PAGE_TOKEN     - Long-lived (non-expiring) Page access token
-
-    # Telegram
-    TG_BOT_TOKEN      - Bot token from @BotFather (looks like 123456:ABC-...)
-    TG_CHAT_ID        - Channel username like "@vigyankiduniya" or numeric -100... id
-                        (the bot must be an ADMIN of the channel)
+    # WhatsApp Channel (Meta Business Cloud API)
+    WA_PHONE_NUMBER_ID  - WhatsApp Business phone number ID
+    WA_ACCESS_TOKEN     - Meta permanent access token
+    WA_CHANNEL_ID       - WhatsApp channel/newsletter ID
 
 Optional:
-    MAX_CATCHUP   - Max backlog posts to share in one run (default 1).
-    DRY_RUN       - "true" => log actions without actually posting.
-    ENABLE_FB     - "true"/"false" (default true)
-    ENABLE_TG     - "true"/"false" (default true)
+    MAX_CATCHUP   - Max backlog posts per run (default 1)
+    DRY_RUN       - "true" => log only, no actual posts
+    ENABLE_LI     - "true"/"false" (default true)
+    ENABLE_WA     - "true"/"false" (default true)
+    ENABLE_FB     - Legacy Facebook (default false — use only if token works)
+    ENABLE_TG     - Legacy Telegram  (default false)
 """
 
 import json
@@ -42,21 +38,19 @@ import html
 from pathlib import Path
 from urllib import request, parse, error
 
-GRAPH_VERSION = "v25.0"
+GRAPH_VERSION = "v21.0"
 STATE_FILE = Path(__file__).parent / "state.json"
 
 
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def log(msg):
-    print(f"[fb-tg-agent] {msg}", flush=True)
+    print(f"[share-agent] {msg}", flush=True)
 
 
 def env(name, default=None, required=False):
     val = os.environ.get(name, default)
     if required and not val:
-        log(f"ERROR: missing required environment variable {name}")
+        log(f"ERROR: missing required env var {name}")
         sys.exit(1)
     return val
 
@@ -69,41 +63,58 @@ def env_bool(name, default=True):
 
 
 def http_get_json(url):
-    req = request.Request(url, headers={"User-Agent": "blogger-fb-tg-agent/1.0"})
+    req = request.Request(url, headers={"User-Agent": "share-agent/2.0"})
     with request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def http_post(url, data, timeout=60):
+def http_post(url, data, timeout=60, headers=None):
     encoded = parse.urlencode(data).encode("utf-8")
-    req = request.Request(url, data=encoded, method="POST",
-                          headers={"User-Agent": "blogger-fb-tg-agent/1.0"})
+    h = {"User-Agent": "share-agent/2.0", "Content-Type": "application/x-www-form-urlencoded"}
+    if headers:
+        h.update(headers)
+    req = request.Request(url, data=encoded, method="POST", headers=h)
     with request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def http_post_json(url, payload, token, timeout=60):
+    """POST with JSON body and Bearer token — used by LinkedIn."""
+    body = json.dumps(payload).encode("utf-8")
+    req = request.Request(
+        url, data=body, method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type":  "application/json",
+            "User-Agent":    "share-agent/2.0",
+            "X-Restli-Protocol-Version": "2.0.0",
+        },
+    )
+    with request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8")
+        return json.loads(raw) if raw else {"status": resp.status}
 
 
 def load_state():
     if STATE_FILE.exists():
         try:
             s = json.loads(STATE_FILE.read_text())
-            s.setdefault("facebook", [])
-            s.setdefault("telegram", [])
+            for k in ("facebook", "telegram", "linkedin", "whatsapp"):
+                s.setdefault(k, [])
             s.setdefault("seeded", False)
             return s
         except json.JSONDecodeError:
-            log("state.json was corrupt; starting fresh")
-    return {"facebook": [], "telegram": [], "seeded": False}
+            log("state.json corrupt — starting fresh")
+    return {"facebook": [], "telegram": [], "linkedin": [], "whatsapp": [], "seeded": False}
 
 
 def save_state(state):
-    for k in ("facebook", "telegram"):
+    for k in ("facebook", "telegram", "linkedin", "whatsapp"):
         state[k] = state[k][-500:]
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-# --------------------------------------------------------------------------- #
-# Blogger
-# --------------------------------------------------------------------------- #
+# ── Blogger ───────────────────────────────────────────────────────────────────
 def fetch_recent_posts(blog_id, api_key, count=10):
     url = (
         f"https://www.googleapis.com/blogger/v3/blogs/{blog_id}/posts"
@@ -113,131 +124,134 @@ def fetch_recent_posts(blog_id, api_key, count=10):
     return http_get_json(url).get("items", [])
 
 
-# Hosts that serve random/placeholder images, not real post images.
-PLACEHOLDER_IMAGE_HOSTS = (
-    "picsum.photos",
-    "via.placeholder.com",
-    "placehold.co",
-    "placekitten.com",
-    "dummyimage.com",
-    "1x1.gif",
-    "data:image",            # inline base64 lazy-load placeholders
+PLACEHOLDER_HOSTS = (
+    "picsum.photos", "via.placeholder.com", "placehold.co",
+    "placekitten.com", "dummyimage.com", "1x1.gif", "data:image",
 )
-
-
-def _is_placeholder(url):
-    low = url.lower()
-    return any(h in low for h in PLACEHOLDER_IMAGE_HOSTS)
-
-
-# Hosts that serve REAL post images we should actively prefer.
-PREFERRED_IMAGE_HOSTS = (
-    "pollinations.ai",
-    "blogger.googleusercontent.com",
-    "bp.blogspot.com",
-    "lh3.googleusercontent.com",
+PREFERRED_HOSTS = (
+    "pollinations.ai", "blogger.googleusercontent.com",
+    "bp.blogspot.com", "lh3.googleusercontent.com",
+    "catbox.moe", "files.catbox.moe",
 )
-
-
-def _find_in_content_by_host(content, hosts):
-    """Return the first image URL in the content served from one of `hosts`."""
-    for m in re.finditer(r'<img[^>]+>', content, re.IGNORECASE):
-        tag = m.group(0)
-        # check all url-bearing attributes on this <img>
-        for attr in ("data-src", "data-lazy-src", "data-original", "src"):
-            am = re.search(attr + r'=["\']([^"\']+)["\']', tag, re.IGNORECASE)
-            if am:
-                url = am.group(1)
-                low = url.lower()
-                if any(h in low for h in hosts) and not _is_placeholder(url):
-                    return url
-    return None
-
-
-def _og_image_from_page(post_url):
-    """
-    Fetch the post's page HTML and read its <meta property="og:image">.
-    Best-effort only: many blogs sit behind bot protection (Cloudflare etc.)
-    that returns 403 to server requests, so this often fails -- callers must
-    treat None as normal and fall back.
-    """
-    if not post_url:
-        return None
-    try:
-        req = request.Request(
-            post_url,
-            headers={"User-Agent": "Mozilla/5.0 (blogger-fb-tg-agent)"},
-        )
-        with request.urlopen(req, timeout=20) as resp:
-            head = resp.read(120_000).decode("utf-8", "ignore")
-    except Exception:  # noqa: BLE001
-        return None
-
-    for pattern in (
-        r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
-        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
-        r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
-    ):
-        m = re.search(pattern, head, re.IGNORECASE)
-        if m and not _is_placeholder(m.group(1)):
-            return m.group(1)
-    return None
 
 
 def extract_image(post):
     content = post.get("content", "") or ""
-
-    # 1. Strongly prefer a known real-image host in the post body
-    #    (Pollinations AI image, Blogger/Blogspot uploads, etc.).
-    url = _find_in_content_by_host(content, PREFERRED_IMAGE_HOSTS)
-    if url:
-        return url
-
-    # 2. Blogger API's own image field, unless it's a placeholder.
+    for host_list in (PREFERRED_HOSTS, None):
+        for attr in ("data-src", "data-lazy-src", "data-original", "src"):
+            for m in re.finditer(
+                r'<img[^>]+' + attr + r'=["\']([^"\']+)["\']', content, re.IGNORECASE
+            ):
+                u = m.group(1)
+                bad = any(h in u.lower() for h in PLACEHOLDER_HOSTS)
+                if bad:
+                    continue
+                if host_list is None or any(h in u.lower() for h in host_list):
+                    return u
     images = post.get("images")
-    if images and isinstance(images, list) and images[0].get("url"):
-        u = images[0]["url"]
-        if not _is_placeholder(u):
+    if images and isinstance(images, list):
+        u = images[0].get("url", "")
+        if u and not any(h in u.lower() for h in PLACEHOLDER_HOSTS):
             return u
-
-    # 3. Any other real <img> in the body (lazy-load attrs first), skipping
-    #    placeholders.
-    for attr in ("data-src", "data-lazy-src", "data-original", "src"):
-        for m in re.finditer(
-            r'<img[^>]+' + attr + r'=["\']([^"\']+)["\']',
-            content, re.IGNORECASE,
-        ):
-            u = m.group(1)
-            if u and not _is_placeholder(u):
-                return u
-
-    # 4. Last resort: page og:image (often blocked by bot protection).
-    return _og_image_from_page(post.get("url"))
+    return None
 
 
 def plain_excerpt(post, limit=300):
     content = post.get("content", "") or ""
-    # Strip <script>/<style> blocks first so embedded JSON-LD schema metadata
-    # and CSS don't leak into the excerpt.
     content = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ",
                      content, flags=re.IGNORECASE | re.DOTALL)
-    text = re.sub(r"<[^>]+>", " ", content)        # strip remaining tags
+    text = re.sub(r"<[^>]+>", " ", content)
     text = html.unescape(text)
-    # Drop any leftover JSON-LD-ish noise (lines that are mostly punctuation/braces).
     text = re.sub(r'\{[^}]*"@context"[^}]*\}', " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     if len(text) > limit:
-        text = text[:limit].rsplit(" ", 1)[0] + "\u2026"
+        text = text[:limit].rsplit(" ", 1)[0] + "…"
     return text
 
 
-# --------------------------------------------------------------------------- #
-# Facebook
-# --------------------------------------------------------------------------- #
+# ── LinkedIn ──────────────────────────────────────────────────────────────────
+def post_to_linkedin(author_urn, token, title, link, excerpt, image_url, dry_run=False):
+    """
+    Share an article on LinkedIn using the UGC Posts API.
+    Uses ARTICLE media category with og-style link attachment.
+    """
+    text = f"{title}\n\n{excerpt}\n\n🔬 पूरा पढ़ें: {link}"
+    if len(text) > 3000:
+        text = text[:2990] + "…"
+
+    payload = {
+        "author": author_urn,
+        "lifecycleState": "PUBLISHED",
+        "specificContent": {
+            "com.linkedin.ugc.ShareContent": {
+                "shareCommentary": {"text": text},
+                "shareMediaCategory": "ARTICLE",
+                "media": [
+                    {
+                        "status": "READY",
+                        "originalUrl": link,
+                        "title": {"text": title[:200]},
+                        "description": {"text": excerpt[:400]},
+                    }
+                ],
+            }
+        },
+        "visibility": {
+            "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"
+        },
+    }
+
+    if dry_run:
+        log(f"   [DRY] LI post: {title[:60]}")
+        return {"dry_run": True}
+
+    try:
+        resp = http_post_json(
+            "https://api.linkedin.com/v2/ugcPosts",
+            payload, token, timeout=30,
+        )
+        return resp
+    except error.HTTPError as e:
+        body = e.read().decode("utf-8", "ignore")
+        raise Exception(f"HTTP {e.code}: {body[:200]}")
+
+
+# ── WhatsApp Channel ──────────────────────────────────────────────────────────
+def post_to_whatsapp(phone_number_id, wa_token, channel_id, title, link, excerpt, dry_run=False):
+    """
+    Post to a WhatsApp Channel via Meta Business Cloud API.
+    Uses sendMessage endpoint with newsletter/channel type.
+    """
+    # Build message text (WhatsApp supports basic formatting)
+    msg = f"*{title}*\n\n{excerpt}\n\n🔗 {link}"
+    if len(msg) > 4096:
+        msg = msg[:4080] + "…"
+
+    if dry_run:
+        log(f"   [DRY] WA post: {title[:60]}")
+        return {"dry_run": True}
+
+    # WhatsApp Business Cloud API — send to channel
+    url = (
+        f"https://graph.facebook.com/{GRAPH_VERSION}/"
+        f"{phone_number_id}/messages"
+    )
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": channel_id,
+        "type": "text",
+        "text": json.dumps({"preview_url": True, "body": msg}),
+        "access_token": wa_token,
+    }
+    return http_post(url, payload, timeout=30)
+
+
+# ── Legacy Facebook (optional) ────────────────────────────────────────────────
 def post_to_facebook(page_id, token, title, link, image_url, dry_run=False):
     caption = f"{title}\n\n{link}"
     if dry_run:
-        log(f"   [DRY] FB caption={caption!r} image={image_url}")
+        log(f"   [DRY] FB: {caption[:60]}")
         return {"dry_run": True}
     if image_url:
         endpoint = f"https://graph.facebook.com/{GRAPH_VERSION}/{page_id}/photos"
@@ -248,102 +262,83 @@ def post_to_facebook(page_id, token, title, link, image_url, dry_run=False):
     return http_post(endpoint, payload)
 
 
-# --------------------------------------------------------------------------- #
-# Telegram
-# --------------------------------------------------------------------------- #
-def _warm_up_image(image_url):
-    """
-    Request the image once ourselves so a lazily-generated image (e.g. a
-    Pollinations URL behind Google's proxy) is rendered/cached before we ask
-    Telegram to fetch it. Best-effort; ignores all errors.
-    """
-    if not image_url:
-        return
-    try:
-        req = request.Request(image_url, headers={"User-Agent": "Mozilla/5.0"})
-        with request.urlopen(req, timeout=45) as r:
-            r.read(2048)  # touch the first bytes; that's enough to trigger gen
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def post_to_telegram(bot_token, chat_id, title, link, excerpt, image_url,
-                     dry_run=False):
-    """
-    Telegram caption supports HTML, so we make the title bold and the link a
-    real clickable "Read more" anchor. Caption hard limit is 1024 chars.
-
-    If sending the photo fails (e.g. Telegram times out fetching a slow image
-    URL), fall back to a plain text message with a link preview so the post is
-    never silently lost.
-    """
-    safe_title = html.escape(title)
+# ── Legacy Telegram (optional) ────────────────────────────────────────────────
+def post_to_telegram(bot_token, chat_id, title, link, excerpt, image_url, dry_run=False):
+    safe_title   = html.escape(title)
     safe_excerpt = html.escape(excerpt)
-    safe_link = html.escape(link, quote=True)
+    safe_link    = html.escape(link, quote=True)
     caption = (
-        f"<b>{safe_title}</b>\n\n"
-        f"{safe_excerpt}\n\n"
-        f"<a href=\"{safe_link}\">\u092a\u0942\u0930\u093e \u092a\u0922\u093c\u0947\u0902 \u00bb</a>"  # "पूरा पढ़ें »"
+        f"<b>{safe_title}</b>\n\n{safe_excerpt}\n\n"
+        f"<a href=\"{safe_link}\">पूरा पढ़ें »</a>"
     )
     if len(caption) > 1024:
-        caption = caption[:1000].rsplit(" ", 1)[0] + "\u2026"
-
+        caption = caption[:1000].rsplit(" ", 1)[0] + "…"
     if dry_run:
-        log(f"   [DRY] TG chat={chat_id} caption={caption!r} image={image_url}")
+        log(f"   [DRY] TG: {title[:60]}")
         return {"dry_run": True}
-
-    send_msg_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    base = f"https://api.telegram.org/bot{bot_token}"
     text_payload = {
-        "chat_id": chat_id,
-        "text": caption,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": "false",
+        "chat_id": chat_id, "text": caption,
+        "parse_mode": "HTML", "disable_web_page_preview": "false",
     }
-
     if image_url:
-        _warm_up_image(image_url)  # pre-render slow images before Telegram fetches
-        photo_url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
         photo_payload = {
-            "chat_id": chat_id,
-            "photo": image_url,
-            "caption": caption,
-            "parse_mode": "HTML",
+            "chat_id": chat_id, "photo": image_url,
+            "caption": caption, "parse_mode": "HTML",
         }
         try:
-            # Generous timeout: Telegram must fetch the image server-side.
-            return http_post(photo_url, photo_payload, timeout=120)
-        except Exception as e:  # noqa: BLE001
-            log(f"   TG photo failed ({e}); falling back to text+link message.")
-            return http_post(send_msg_url, text_payload, timeout=60)
-
-    return http_post(send_msg_url, text_payload, timeout=60)
+            return http_post(f"{base}/sendPhoto", photo_payload, timeout=120)
+        except Exception as e:
+            log(f"   TG photo failed ({e}); falling back to text.")
+            return http_post(f"{base}/sendMessage", text_payload, timeout=60)
+    return http_post(f"{base}/sendMessage", text_payload, timeout=60)
 
 
-# --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    blog_id = env("BLOG_ID", required=True)
-    api_key = env("BLOGGER_API_KEY", required=True)
+    blog_id    = env("BLOG_ID", required=True)
+    api_key    = env("BLOGGER_API_KEY", required=True)
     max_catchup = int(env("MAX_CATCHUP", "1"))
-    dry_run = env_bool("DRY_RUN", False)
+    dry_run    = env_bool("DRY_RUN", False)
 
-    enable_fb = env_bool("ENABLE_FB", True)
-    enable_tg = env_bool("ENABLE_TG", True)
+    # Platform toggles
+    enable_li  = env_bool("ENABLE_LI", True)
+    enable_wa  = env_bool("ENABLE_WA", True)
+    enable_fb  = env_bool("ENABLE_FB", False)   # disabled by default
+    enable_tg  = env_bool("ENABLE_TG", False)   # disabled by default
 
+    # LinkedIn
+    li_token      = env("LI_ACCESS_TOKEN")
+    li_author_urn = env("LI_AUTHOR_URN")
+
+    # WhatsApp
+    wa_phone_id  = env("WA_PHONE_NUMBER_ID")
+    wa_token     = env("WA_ACCESS_TOKEN")
+    wa_channel   = env("WA_CHANNEL_ID")
+
+    # Legacy
     fb_page_id = env("FB_PAGE_ID")
-    fb_token = env("FB_PAGE_TOKEN")
-    tg_bot_token = env("TG_BOT_TOKEN")
-    tg_chat_id = env("TG_CHAT_ID")
+    fb_token   = env("FB_PAGE_TOKEN")
+    tg_bot     = env("TG_BOT_TOKEN")
+    tg_chat    = env("TG_CHAT_ID")
 
+    # Disable if credentials missing
+    if enable_li and not (li_token and li_author_urn):
+        log("LinkedIn credentials missing — disabling LI.")
+        enable_li = False
+    if enable_wa and not (wa_phone_id and wa_token and wa_channel):
+        log("WhatsApp credentials missing — disabling WA.")
+        enable_wa = False
     if enable_fb and not (fb_page_id and fb_token):
-        log("Facebook enabled but FB_PAGE_ID/FB_PAGE_TOKEN missing; disabling FB.")
+        log("Facebook credentials missing — disabling FB.")
         enable_fb = False
-    if enable_tg and not (tg_bot_token and tg_chat_id):
-        log("Telegram enabled but TG_BOT_TOKEN/TG_CHAT_ID missing; disabling TG.")
+    if enable_tg and not (tg_bot and tg_chat):
+        log("Telegram credentials missing — disabling TG.")
         enable_tg = False
 
-    state = load_state()
+    state   = load_state()
+    li_done = set(state["linkedin"])
+    wa_done = set(state["whatsapp"])
     fb_done = set(state["facebook"])
     tg_done = set(state["telegram"])
 
@@ -355,64 +350,97 @@ def main():
         sys.exit(1)
 
     if not posts:
-        log("No posts returned. Nothing to do.")
+        log("No posts found.")
         return
 
-    # First-ever run: seed everything except the newest `max_catchup` as done,
-    # so we don't blast the whole archive to both platforms.
     if not state["seeded"]:
-        log("First run -- seeding history so only newest post(s) go out.")
+        log("First run — seeding history.")
         for p in posts[max_catchup:]:
-            fb_done.add(p["id"])
-            tg_done.add(p["id"])
+            for done_set in (li_done, wa_done, fb_done, tg_done):
+                done_set.add(p["id"])
         state["seeded"] = True
 
-    ordered = list(reversed(posts))  # oldest-first => natural timeline order
+    ordered = list(reversed(posts))  # oldest-first
+    li_count = wa_count = fb_count = tg_count = 0
 
-    fb_count = tg_count = 0
     for post in ordered:
-        pid = post["id"]
-        title = post.get("title", "(untitled)")
-        link = post.get("url", "")
-        image = extract_image(post)
+        pid     = post["id"]
+        title   = post.get("title", "(untitled)")
+        link    = post.get("url", "")
+        image   = extract_image(post)
         excerpt = plain_excerpt(post)
 
-        # ---- Facebook ----
+        # ── LinkedIn ──────────────────────────────────────────────────────────
+        if enable_li and pid not in li_done:
+            log(f"LI  sharing: {title}")
+            try:
+                resp = post_to_linkedin(
+                    li_author_urn, li_token, title, link, excerpt, image,
+                    dry_run=dry_run,
+                )
+                log(f"   LI -> {str(resp)[:120]}")
+                li_done.add(pid)
+                li_count += 1
+            except Exception as e:
+                log(f"   !! LI error: {e}")
+
+        # ── WhatsApp Channel ──────────────────────────────────────────────────
+        if enable_wa and pid not in wa_done:
+            log(f"WA  sharing: {title}")
+            try:
+                resp = post_to_whatsapp(
+                    wa_phone_id, wa_token, wa_channel,
+                    title, link, excerpt, dry_run=dry_run,
+                )
+                log(f"   WA -> {str(resp)[:120]}")
+                wa_done.add(pid)
+                wa_count += 1
+            except Exception as e:
+                log(f"   !! WA error: {e}")
+
+        # ── Legacy Facebook ───────────────────────────────────────────────────
         if enable_fb and pid not in fb_done:
             log(f"FB  sharing: {title}")
             try:
-                resp = post_to_facebook(fb_page_id, fb_token, title, link, image,
-                                        dry_run=dry_run)
-                log(f"   FB -> {resp}")
+                resp = post_to_facebook(
+                    fb_page_id, fb_token, title, link, image, dry_run=dry_run
+                )
+                log(f"   FB -> {str(resp)[:120]}")
                 fb_done.add(pid)
                 fb_count += 1
             except error.HTTPError as e:
-                log(f"   !! FB error {e.code}: {e.read().decode('utf-8','ignore')}")
-            except Exception as e:  # noqa: BLE001
+                log(f"   !! FB error {e.code}: {e.read().decode('utf-8','ignore')[:100]}")
+            except Exception as e:
                 log(f"   !! FB unexpected: {e}")
 
-        # ---- Telegram ----
+        # ── Legacy Telegram ───────────────────────────────────────────────────
         if enable_tg and pid not in tg_done:
             log(f"TG  sharing: {title}")
             try:
-                resp = post_to_telegram(tg_bot_token, tg_chat_id, title, link,
-                                        excerpt, image, dry_run=dry_run)
+                resp = post_to_telegram(
+                    tg_bot, tg_chat, title, link, excerpt, image, dry_run=dry_run
+                )
                 ok = resp.get("ok", True) if isinstance(resp, dict) else True
-                log(f"   TG -> {resp}")
+                log(f"   TG -> {str(resp)[:120]}")
                 if ok:
                     tg_done.add(pid)
                     tg_count += 1
                 else:
-                    log("   !! TG returned ok=false; will retry next run.")
+                    log("   !! TG ok=false — will retry next run.")
             except error.HTTPError as e:
-                log(f"   !! TG error {e.code}: {e.read().decode('utf-8','ignore')}")
-            except Exception as e:  # noqa: BLE001
+                log(f"   !! TG error {e.code}: {e.read().decode('utf-8','ignore')[:100]}")
+            except Exception as e:
                 log(f"   !! TG unexpected: {e}")
 
-    state["facebook"] = list(fb_done)
-    state["telegram"] = list(tg_done)
+    state["linkedin"]  = list(li_done)
+    state["whatsapp"]  = list(wa_done)
+    state["facebook"]  = list(fb_done)
+    state["telegram"]  = list(tg_done)
     save_state(state)
-    log(f"Done. Facebook posted {fb_count}, Telegram posted {tg_count}.")
+    log(
+        f"Done. LinkedIn posted {li_count}, WhatsApp posted {wa_count}, "
+        f"Facebook posted {fb_count}, Telegram posted {tg_count}."
+    )
 
 
 if __name__ == "__main__":
